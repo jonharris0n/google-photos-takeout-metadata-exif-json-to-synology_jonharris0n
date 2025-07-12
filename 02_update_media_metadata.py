@@ -13,6 +13,9 @@ from pillow_heif import register_heif_opener
 import re
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import gc
+import weakref
+from collections import defaultdict
 
 # google-photos-takeout-metadata-exif-json-to-synology
 # https://github.com/alexmonnerie/google-photos-takeout-metadata-exif-json-to-synology/
@@ -131,6 +134,12 @@ class MediaProcessor:
             re.compile(r"-\d+$"),
         ]
 
+        # Memory management settings
+        self._json_cache_limit = 5000  # Limit cache size to prevent memory bloat
+        self._json_metadata_cache_limit = 3000  # Limit metadata cache size
+        self._processed_files_count = 0
+        self._gc_interval = 100  # Force garbage collection every 100 files
+
     def _build_json_cache(self):
         """Build a cache of all JSON files for faster lookup"""
         if self._json_cache_built:
@@ -138,10 +147,25 @@ class MediaProcessor:
 
         logging.info("Building JSON file cache for faster processing...")
 
-        # Also create a metadata cache for content-based matching
-        self._json_metadata_cache = {}
+        # Clear existing caches first
+        self._json_cache.clear()
+        self._json_metadata_cache.clear()
+
+        json_files_processed = 0
 
         for json_file in self.work_dir.rglob("*.json"):
+            # Limit cache size to prevent memory issues
+            if len(self._json_cache) >= self._json_cache_limit:
+                logging.warning(
+                    f"JSON cache limit ({self._json_cache_limit}) reached, skipping additional files"
+                )
+                break
+
+            if len(self._json_metadata_cache) >= self._json_metadata_cache_limit:
+                logging.warning(
+                    f"Metadata cache limit ({self._json_metadata_cache_limit}) reached"
+                )
+
             # Store multiple keys for each JSON file to speed up lookups
             json_name = json_file.name
             json_stem = json_file.stem
@@ -165,6 +189,7 @@ class MediaProcessor:
                 self._json_cache[f"{base_name}_supplemental"] = json_file
 
             # Cache metadata content for content-based matching
+            json_data = None
             try:
                 with open(json_file, "r", encoding="utf-8") as f:
                     json_data = json.load(f)
@@ -212,7 +237,12 @@ class MediaProcessor:
                     # Extract people/faces data if available
                     people_in_photo = json_data.get("people", [])
 
-                    if title and timestamp:
+                    if (
+                        title
+                        and timestamp
+                        and len(self._json_metadata_cache)
+                        < self._json_metadata_cache_limit
+                    ):
                         # Store comprehensive metadata for faster access
                         metadata_entry = {
                             "title": title.lower().strip(),
@@ -261,10 +291,20 @@ class MediaProcessor:
             except (json.JSONDecodeError, IOError, KeyError) as e:
                 logging.debug(f"Error reading JSON metadata for {json_file}: {e}")
                 continue
+            finally:
+                # Explicitly clear json_data to free memory
+                if json_data:
+                    del json_data
+
+            json_files_processed += 1
+
+            # Periodic garbage collection during cache building
+            if json_files_processed % 500 == 0:
+                gc.collect()
 
         self._json_cache_built = True
         logging.info(f"JSON cache built with {len(self._json_cache)} entries")
-        metadata_count = len(getattr(self, "_json_metadata_cache", {}))
+        metadata_count = len(self._json_metadata_cache)
         logging.info(f"JSON metadata cache built with {metadata_count} entries")
 
         if metadata_count > 0:
@@ -337,31 +377,39 @@ class MediaProcessor:
                     ]
                 )
 
-            # Special case: Handle Google Photos Takeout numbered duplicates
+            # Enhanced case: Handle Google Photos Takeout numbered duplicates including multiple patterns
             # E.g., IMG_0947(2).JPG -> IMG_0947.JPG.supplemental-metadata(2).json
-            parentheses_match = re.search(r"\((\d+)\)$", base_path.stem)
-            if parentheses_match:
-                number = parentheses_match.group(1)
-                base_stem = base_path.stem[: parentheses_match.start()]
+            # E.g., IMG_0947(2)(3).JPG -> IMG_0947.JPG.supplemental-metadata(2)(3).json
+
+            # Extract all numbered patterns from the filename
+            numbered_patterns = self._extract_numbered_patterns(base_path.stem)
+            if numbered_patterns["has_numbers"]:
+                base_stem = numbered_patterns["base_stem"]
+                number_suffix = numbered_patterns["number_suffix"]
 
                 logging.debug(
-                    f"Found numbered duplicate: {base_path.name} -> base: {base_stem}, number: {number}"
+                    f"Found numbered duplicate: {base_path.name} -> base: {base_stem}, numbers: {number_suffix}"
                 )
 
-                # Generate Google Photos Takeout style JSON names
+                # Generate Google Photos Takeout style JSON names for all variations
                 potential_names.extend(
                     [
-                        f"{base_stem}{base_path.suffix}.supplemental-metadata({number}).json",
-                        f"{base_stem}{base_path.suffix}.supplemental-metadat({number}).json",
-                        f"{base_stem}{base_path.suffix}.supplemental-metad({number}).json",
-                        f"{base_stem}{base_path.suffix}.json({number})",
-                        f"{base_stem}.json({number})",
+                        # Standard patterns with number suffix
+                        f"{base_stem}{base_path.suffix}.supplemental-metadata{number_suffix}.json",
+                        f"{base_stem}{base_path.suffix}.supplemental-metadat{number_suffix}.json",
+                        f"{base_stem}{base_path.suffix}.supplemental-metad{number_suffix}.json",
+                        f"{base_stem}{base_path.suffix}.json{number_suffix}",
+                        f"{base_stem}.json{number_suffix}",
                         # Alternative formats
-                        f"{base_stem}({number}){base_path.suffix}.json",
-                        f"{base_stem}({number}).json",
-                        f"{base_stem}({number}){base_path.suffix}.supplemental-metadata.json",
-                        f"{base_stem}({number}){base_path.suffix}.supplemental-metadat.json",
-                        f"{base_stem}({number}){base_path.suffix}.supplemental-metad.json",
+                        f"{base_stem}{number_suffix}{base_path.suffix}.json",
+                        f"{base_stem}{number_suffix}.json",
+                        f"{base_stem}{number_suffix}{base_path.suffix}.supplemental-metadata.json",
+                        f"{base_stem}{number_suffix}{base_path.suffix}.supplemental-metadat.json",
+                        f"{base_stem}{number_suffix}{base_path.suffix}.supplemental-metad.json",
+                        # Without extension variations
+                        f"{base_stem}.supplemental-metadata{number_suffix}.json",
+                        f"{base_stem}.supplemental-metadat{number_suffix}.json",
+                        f"{base_stem}.supplemental-metad{number_suffix}.json",
                     ]
                 )
 
@@ -387,19 +435,42 @@ class MediaProcessor:
         # Step 3: Fallback to file system search for complex cases
         return self._fallback_json_search(media_path)
 
+    def _extract_numbered_patterns(self, stem):
+        """Extract numbered patterns from filename stem, handling single and multiple patterns"""
+        # Pattern to match one or more numbered duplicates: (1), (2)(3), (1)(2)(3), etc.
+        pattern = re.search(r"(\(\d+\)(?:\(\d+\))*)", stem)
+
+        if pattern:
+            number_suffix = pattern.group(1)  # Full number pattern: (2) or (2)(3)
+            base_stem = stem[: pattern.start()]  # Everything before the numbers
+
+            return {
+                "has_numbers": True,
+                "base_stem": base_stem,
+                "number_suffix": number_suffix,
+                "full_pattern": pattern.group(0),
+            }
+        else:
+            return {
+                "has_numbers": False,
+                "base_stem": stem,
+                "number_suffix": "",
+                "full_pattern": "",
+            }
+
     def _fallback_json_search(self, media_path):
         """Fallback search for complex JSON matching cases"""
         media_stem = media_path.stem
         media_name = media_path.name
 
-        # Special handling for files with numbered duplicates
-        parentheses_match = re.search(r"\((\d+)\)$", media_stem)
-        if parentheses_match:
-            number = parentheses_match.group(1)
-            base_stem = media_stem[: parentheses_match.start()]
+        # Enhanced handling for files with numbered duplicates (single and multiple)
+        numbered_patterns = self._extract_numbered_patterns(media_stem)
+        if numbered_patterns["has_numbers"]:
+            base_stem = numbered_patterns["base_stem"]
+            number_suffix = numbered_patterns["number_suffix"]
 
             logging.debug(
-                f"Fallback search for numbered duplicate: {media_name} -> base: {base_stem}, number: {number}"
+                f"Fallback search for numbered duplicate: {media_name} -> base: {base_stem}, numbers: {number_suffix}"
             )
 
             # Search for Google Photos Takeout style JSON files
@@ -407,12 +478,13 @@ class MediaProcessor:
                 json_name = json_file.name
 
                 # Check for patterns like: IMG_0947.JPG.supplemental-metadata(2).json
+                # or IMG_0947.JPG.supplemental-metadata(2)(3).json
                 if (
-                    f"{base_stem}{media_path.suffix}.supplemental-metadata({number}).json"
+                    f"{base_stem}{media_path.suffix}.supplemental-metadata{number_suffix}.json"
                     in json_name
-                    or f"{base_stem}{media_path.suffix}.supplemental-metadat({number}).json"
+                    or f"{base_stem}{media_path.suffix}.supplemental-metadat{number_suffix}.json"
                     in json_name
-                    or f"{base_stem}{media_path.suffix}.supplemental-metad({number}).json"
+                    or f"{base_stem}{media_path.suffix}.supplemental-metad{number_suffix}.json"
                     in json_name
                 ):
                     logging.info(
@@ -425,14 +497,30 @@ class MediaProcessor:
                 # Check for exact matches in the JSON filename
                 if (
                     json_name
-                    == f"{base_stem}{media_path.suffix}.supplemental-metadata({number}).json"
+                    == f"{base_stem}{media_path.suffix}.supplemental-metadata{number_suffix}.json"
                     or json_name
-                    == f"{base_stem}{media_path.suffix}.supplemental-metadat({number}).json"
+                    == f"{base_stem}{media_path.suffix}.supplemental-metadat{number_suffix}.json"
                     or json_name
-                    == f"{base_stem}{media_path.suffix}.supplemental-metad({number}).json"
+                    == f"{base_stem}{media_path.suffix}.supplemental-metad{number_suffix}.json"
                 ):
                     logging.info(
                         f"JSON file found via exact numbered duplicate matching: {json_file}"
+                    )
+                    with self._stats_lock:
+                        self.stats["json_found_in_other_dir"] += 1
+                    return json_file
+
+                # Also check for patterns without the file extension
+                if (
+                    json_name
+                    == f"{base_stem}.supplemental-metadata{number_suffix}.json"
+                    or json_name
+                    == f"{base_stem}.supplemental-metadat{number_suffix}.json"
+                    or json_name
+                    == f"{base_stem}.supplemental-metad{number_suffix}.json"
+                ):
+                    logging.info(
+                        f"JSON file found via stem-only numbered duplicate matching: {json_file}"
                     )
                     with self._stats_lock:
                         self.stats["json_found_in_other_dir"] += 1
@@ -610,8 +698,9 @@ class MediaProcessor:
 
         # Handle numbered patterns more intelligently
         # Only remove trailing numbers if they're not in parentheses (Google Photos format)
-        if not re.search(r"\(\d+\)$", cleaned):
-            # Remove trailing numbers only if no parentheses
+        numbered_patterns = self._extract_numbered_patterns(cleaned)
+        if not numbered_patterns["has_numbers"]:
+            # Remove trailing numbers only if no parentheses patterns found
             cleaned = re.sub(r"_\d+$", "", cleaned)
             cleaned = re.sub(r"-\d+$", "", cleaned)
 
@@ -820,6 +909,7 @@ class MediaProcessor:
     def _extract_media_characteristics(self, media_path):
         """Extract characteristics from media file for matching"""
         characteristics = {}
+        img = None
 
         try:
             # Get file size
@@ -828,24 +918,32 @@ class MediaProcessor:
             # For images, try to extract EXIF data
             if media_path.suffix.lower() in IMAGE_FORMATS:
                 try:
-                    with Image.open(media_path) as img:
-                        exif_data = img._getexif()
-                        if exif_data:
-                            for tag_id, value in exif_data.items():
-                                tag = TAGS.get(tag_id, tag_id)
-                                if tag == "Make":
-                                    characteristics["camera_make"] = str(value).lower()
-                                elif tag == "Model":
-                                    characteristics["camera_model"] = str(value).lower()
-                                elif tag == "GPSInfo":
-                                    characteristics["has_geo"] = True
+                    img = Image.open(media_path)
+                    exif_data = img._getexif()
+                    if exif_data:
+                        for tag_id, value in exif_data.items():
+                            tag = TAGS.get(tag_id, tag_id)
+                            if tag == "Make":
+                                characteristics["camera_make"] = str(value).lower()
+                            elif tag == "Model":
+                                characteristics["camera_model"] = str(value).lower()
+                            elif tag == "GPSInfo":
+                                characteristics["has_geo"] = True
                 except Exception:
                     pass  # EXIF extraction failed, continue without it
+                finally:
+                    if img:
+                        img.close()
+                        del img
 
         except Exception as e:
             logging.debug(
                 f"Error extracting media characteristics from {media_path}: {e}"
             )
+        finally:
+            if img:
+                img.close()
+                del img
 
         return characteristics
 
@@ -1001,6 +1099,9 @@ class MediaProcessor:
         if image_path.suffix.lower() not in IMAGE_FORMATS:
             return
 
+        img = None
+        exif_dict = None
+
         try:
             timestamp = int(json_data["photoTakenTime"]["timestamp"])
             date_time = datetime.fromtimestamp(timestamp).strftime("%Y:%m:%d %H:%M:%S")
@@ -1038,15 +1139,17 @@ class MediaProcessor:
 
             exif_bytes = piexif.dump(exif_dict)
 
-            # More efficient image processing
+            # More efficient image processing with proper cleanup
             try:
-                with Image.open(image_path) as img:
-                    # Save directly without creating intermediate objects
-                    img.save(image_path, exif=exif_bytes, optimize=True)
+                img = Image.open(image_path)
+                img.save(image_path, exif=exif_bytes, optimize=True)
             except Exception as img_error:
                 # Fallback without optimization if there's an issue
-                with Image.open(image_path) as img:
-                    img.save(image_path, exif=exif_bytes)
+                if img:
+                    img.close()
+                    del img
+                img = Image.open(image_path)
+                img.save(image_path, exif=exif_bytes)
 
         except Exception as e:
             logging.warning(
@@ -1056,30 +1159,48 @@ class MediaProcessor:
                 self.stats["warnings"] += 1
             with self._files_lock:
                 self.files_with_warnings.append((str(image_path), str(e)))
+        finally:
+            # Explicit cleanup
+            if img:
+                img.close()
+                del img
+            if exif_dict:
+                del exif_dict
 
     def create_gps_dict(self, lat, lon):
         """Create GPS dictionary for EXIF data"""
-        lat_deg = self.convert_to_degrees(abs(lat))
-        lon_deg = self.convert_to_degrees(abs(lon))
+        try:
+            # Convert decimal degrees to degrees, minutes, seconds
+            def dd_to_dms(decimal_degrees):
+                """Convert decimal degrees to degrees, minutes, seconds format"""
+                degrees = int(abs(decimal_degrees))
+                minutes_float = (abs(decimal_degrees) - degrees) * 60
+                minutes = int(minutes_float)
+                seconds = (minutes_float - minutes) * 60
+                return [(degrees, 1), (minutes, 1), (int(seconds * 100), 100)]
 
-        return {
-            piexif.GPSIFD.GPSLatitudeRef: "N".encode() if lat >= 0 else "S".encode(),
-            piexif.GPSIFD.GPSLatitude: lat_deg,
-            piexif.GPSIFD.GPSLongitudeRef: "E".encode() if lon >= 0 else "W".encode(),
-            piexif.GPSIFD.GPSLongitude: lon_deg,
-        }
+            # Determine latitude and longitude directions
+            lat_ref = b"N" if lat >= 0 else b"S"
+            lon_ref = b"E" if lon >= 0 else b"W"
 
-    @staticmethod
-    def convert_to_degrees(value):
-        """Converts decimal value into degrees for EXIF format"""
-        d = int(value)
-        m = int((value - d) * 60)
-        s = int(((value - d) * 60 - m) * 60)
-        return ((d, 1), (m, 1), (s, 1))
+            gps_dict = {
+                piexif.GPSIFD.GPSVersionID: (2, 3, 0, 0),
+                piexif.GPSIFD.GPSLatitudeRef: lat_ref,
+                piexif.GPSIFD.GPSLatitude: dd_to_dms(lat),
+                piexif.GPSIFD.GPSLongitudeRef: lon_ref,
+                piexif.GPSIFD.GPSLongitude: dd_to_dms(lon),
+            }
+
+            return gps_dict
+
+        except Exception as e:
+            logging.warning(f"Error creating GPS dictionary: {e}")
+            return {}
 
     def process_media_file(self, media_path):
         """Processes a media file, main processing function"""
         json_path = self.find_json_file(media_path)
+        json_data = None
 
         if not json_path:
             logging.warning(f"JSON file not found for {media_path}")
@@ -1092,7 +1213,7 @@ class MediaProcessor:
         try:
             logging.debug(f"JSON file used {json_path}")
 
-            # More efficient JSON loading
+            # More efficient JSON loading with proper cleanup
             with open(json_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
 
@@ -1128,6 +1249,10 @@ class MediaProcessor:
                 self.stats["warnings"] += 1
             with self._files_lock:
                 self.files_with_warnings.append((str(media_path), str(e)))
+        finally:
+            # Explicit cleanup
+            if json_data:
+                del json_data
 
     def process_directory(self):
         """Processes all media files stored in directory"""
@@ -1166,9 +1291,19 @@ class MediaProcessor:
             logging.debug(f"Processing file: {file_path}")
             self.process_media_file(file_path)
 
+            # Increment processed files counter for memory management
+            self._processed_files_count += 1
+
             # Update progress
             with progress_lock:
                 processed_count += 1
+
+                # Periodic garbage collection to prevent memory buildup
+                if processed_count % self._gc_interval == 0:
+                    gc.collect()
+                    logging.debug(
+                        f"Garbage collection triggered at {processed_count} files"
+                    )
 
                 # Show progress at regular intervals or for milestones
                 if (
@@ -1200,35 +1335,38 @@ class MediaProcessor:
                             f"- {files_per_second:.1f} files/sec{eta_str}"
                         )
                     else:
+                        eta_str = ""
                         logging.info(
                             f"Progress: {processed_count}/{total_files} files processed "
                             f"({processed_count/total_files*100:.1f}%)"
                         )
 
-        # Use ThreadPoolExecutor with optimal number of threads
+        # Use ThreadPoolExecutor with conservative thread count for memory efficiency
         cpu_count = os.cpu_count() or 1
 
-        # Optimize for I/O-intensive workloads (file reading, JSON parsing, EXIF writing)
-        # For mixed I/O and CPU work, use 2-3x CPU cores but cap at reasonable limits
+        # Reduce thread count to prevent excessive memory usage
         if cpu_count <= 4:
-            max_workers = min(8, cpu_count * 2)
+            max_workers = min(4, cpu_count)
         elif cpu_count <= 8:
-            max_workers = min(16, int(cpu_count * 1.5))
+            max_workers = min(8, cpu_count)
         else:
-            max_workers = min(24, cpu_count + 4)
+            max_workers = min(12, cpu_count)
 
-        # Additional optimization for AMD Ryzen Embedded R1600 (2 cores/4 threads)
-        if cpu_count == 4:  # R1600 reports 4 logical cores
-            max_workers = (
-                8  # Use 8 threads for optimal I/O performance on 2-core/4-thread CPU
-            )
+        # Conservative thread count for systems with limited resources
+        if cpu_count <= 4:
+            max_workers = 4  # Conservative for lower-end systems
+        else:
+            max_workers = min(max_workers, 8)  # Cap at 8 for higher-end systems
 
         logging.info(
-            f"CPU cores detected: {cpu_count}, using {max_workers} threads for parallel processing"
+            f"CPU cores detected: {cpu_count}, using {max_workers} threads for parallel processing (memory optimized)"
         )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             executor.map(process_file, media_files)
+
+        # Final cleanup
+        gc.collect()
 
         # Final progress report
         total_time = datetime.now() - start_time
@@ -1294,10 +1432,10 @@ class MediaProcessor:
             self._write_summary_files()
 
             # In rare cases, if JSON can't be found and error processing occurs, it's possible to manually set date and time for media by referring to the file name or album name in which it's located.
-            reponse = input(
+            response = input(
                 "\nDo you want manually set date and time for files without JSON? (y/n) "
             )
-            if reponse.lower() == "y":
+            if response.lower() == "y":
                 for file in self.files_without_json:
                     date_str = input(
                         f"\nEnter date and time for {file} \nFormat YYYY-MM-DD HH:MM (or press Enter to skip) : "
@@ -1363,7 +1501,6 @@ class MediaProcessor:
     def _write_missing_json_analysis(self, analysis_file):
         """Analyze patterns in files without JSON to help improve matching"""
         try:
-            from collections import defaultdict
             import re
 
             # Analyze patterns
@@ -1519,7 +1656,7 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Simulate proccessing without modifying files",
+        help="Simulate processing without modifying files",
     )
     parser.add_argument(
         "--conservative",
