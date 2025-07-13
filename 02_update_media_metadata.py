@@ -11,11 +11,12 @@ import shutil
 import unicodedata
 from pillow_heif import register_heif_opener
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import gc
 import weakref
 from collections import defaultdict
+from tqdm import tqdm
 
 # google-photos-takeout-metadata-exif-json-to-synology
 # https://github.com/alexmonnerie/google-photos-takeout-metadata-exif-json-to-synology/
@@ -49,10 +50,18 @@ ALL_FORMATS = {ext.lower() for ext in list(IMAGE_FORMATS) + list(VIDEO_FORMATS)}
 
 
 class MediaProcessor:
-    def __init__(self, work_dir, debug=False, dry_run=False, conservative=False):
+    def __init__(
+        self,
+        work_dir,
+        debug=False,
+        dry_run=False,
+        conservative=False,
+        no_progress=False,
+    ):
         self.work_dir = Path(work_dir)
         self.dry_run = dry_run
         self.conservative = conservative
+        self.no_progress = no_progress
         self.stats = {
             "success": 0,
             "warnings": 0,
@@ -138,10 +147,11 @@ class MediaProcessor:
         self._json_cache_limit = 5000  # Limit cache size to prevent memory bloat
         self._json_metadata_cache_limit = 3000  # Limit metadata cache size
         self._processed_files_count = 0
-        self._gc_interval = 100  # Force garbage collection every 100 files
+        # OPTIMIZATION: Reduce garbage collection frequency for better performance
+        self._gc_interval = 500  # Increased from 100 to 500 files
 
     def _build_json_cache(self):
-        """Build a cache of all JSON files for faster lookup"""
+        """Build a cache of all JSON files for faster lookup - OPTIMIZED"""
         if self._json_cache_built:
             return
 
@@ -151,9 +161,38 @@ class MediaProcessor:
         self._json_cache.clear()
         self._json_metadata_cache.clear()
 
+        # OPTIMIZATION: Use faster glob pattern for JSON files
+        start_cache_time = datetime.now()
+        json_files = list(self.work_dir.rglob("*.json"))
+        total_json_files = len(json_files)
+
+        if total_json_files == 0:
+            logging.info("No JSON files found to cache")
+            self._json_cache_built = True
+            return
+
         json_files_processed = 0
 
-        for json_file in self.work_dir.rglob("*.json"):
+        # OPTIMIZATION: Skip progress bar for JSON caching if not many files
+        use_json_progress = False
+        if total_json_files > 1000:  # Only show progress for large numbers
+            try:
+                json_progress = tqdm(
+                    json_files,
+                    desc="Caching JSON files",
+                    unit="files",
+                    unit_scale=False,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}]",
+                    disable=self.no_progress,
+                )
+                use_json_progress = True
+            except (ImportError, NameError):
+                json_progress = json_files
+                use_json_progress = False
+        else:
+            json_progress = json_files
+
+        for json_file in json_progress:
             # Limit cache size to prevent memory issues
             if len(self._json_cache) >= self._json_cache_limit:
                 logging.warning(
@@ -243,7 +282,7 @@ class MediaProcessor:
                         and len(self._json_metadata_cache)
                         < self._json_metadata_cache_limit
                     ):
-                        # Store comprehensive metadata for faster access
+                        # Store comprehensive metadata for faster access (keeping rich metadata)
                         metadata_entry = {
                             "title": title.lower().strip(),
                             "timestamp": timestamp,
@@ -279,9 +318,9 @@ class MediaProcessor:
                         if title_key not in self._json_cache:
                             self._json_cache[title_key] = json_file
 
-                        # Store truncated titles for matching
-                        if len(title) > 20:
-                            for length in [50, 40, 30, 20]:
+                        # Store truncated titles for matching - OPTIMIZED: reduced truncations
+                        if len(title) > 30:  # Increased threshold
+                            for length in [40, 30]:  # Reduced number of truncations
                                 if len(title) > length:
                                     truncated_title = title[:length].lower().strip()
                                     truncated_key = f"title_trunc_{truncated_title}"
@@ -301,6 +340,10 @@ class MediaProcessor:
             # Periodic garbage collection during cache building
             if json_files_processed % 500 == 0:
                 gc.collect()
+
+        # Close progress bar if it was created
+        if use_json_progress and hasattr(json_progress, "close"):
+            json_progress.close()
 
         self._json_cache_built = True
         logging.info(f"JSON cache built with {len(self._json_cache)} entries")
@@ -907,43 +950,46 @@ class MediaProcessor:
         return None
 
     def _extract_media_characteristics(self, media_path):
-        """Extract characteristics from media file for matching"""
+        """Extract characteristics from media file for matching - OPTIMIZED"""
         characteristics = {}
-        img = None
 
         try:
-            # Get file size
-            characteristics["file_size"] = media_path.stat().st_size
+            # OPTIMIZATION: Use os.stat directly instead of pathlib for better performance
+            stat_info = os.stat(media_path)
+            characteristics["file_size"] = stat_info.st_size
 
-            # For images, try to extract EXIF data
+            # OPTIMIZATION: Skip image opening for characteristics unless absolutely necessary
+            # Most matching can be done with filename patterns and file size
+            # Only extract EXIF if we need camera info for metadata matching
             if media_path.suffix.lower() in IMAGE_FORMATS:
+                # Try lightweight EXIF extraction without opening full image
                 try:
-                    img = Image.open(media_path)
-                    exif_data = img._getexif()
-                    if exif_data:
-                        for tag_id, value in exif_data.items():
-                            tag = TAGS.get(tag_id, tag_id)
-                            if tag == "Make":
+                    # Quick EXIF check using piexif directly (faster than PIL)
+                    exif_dict = piexif.load(str(media_path))
+
+                    # Extract basic camera info from EXIF if available
+                    if "0th" in exif_dict:
+                        for tag_id, value in exif_dict["0th"].items():
+                            tag_name = (
+                                piexif.TAGS["0th"].get(tag_id, {}).get("name", "")
+                            )
+                            if tag_name == "Make":
                                 characteristics["camera_make"] = str(value).lower()
-                            elif tag == "Model":
+                            elif tag_name == "Model":
                                 characteristics["camera_model"] = str(value).lower()
-                            elif tag == "GPSInfo":
-                                characteristics["has_geo"] = True
+
+                    # Check for GPS data
+                    if "GPS" in exif_dict and exif_dict["GPS"]:
+                        characteristics["has_geo"] = True
+
                 except Exception:
-                    pass  # EXIF extraction failed, continue without it
-                finally:
-                    if img:
-                        img.close()
-                        del img
+                    # If piexif fails, fall back to basic characteristics
+                    pass
 
         except Exception as e:
             logging.debug(
                 f"Error extracting media characteristics from {media_path}: {e}"
             )
-        finally:
-            if img:
-                img.close()
-                del img
 
         return characteristics
 
@@ -1095,7 +1141,7 @@ class MediaProcessor:
         logging.debug(f"Updated system dates for {file_path}")
 
     def update_image_exif(self, image_path, json_data):
-        """Update an picture's EXIF metadata"""
+        """Update an picture's EXIF metadata - OPTIMIZED"""
         if image_path.suffix.lower() not in IMAGE_FORMATS:
             return
 
@@ -1112,12 +1158,15 @@ class MediaProcessor:
                 )
                 return
 
+            # OPTIMIZATION: Pre-encode datetime once
+            date_time_bytes = date_time.encode("ascii")
+
             # Pre-build EXIF dictionary for better performance
             exif_dict = {
                 "0th": {},
                 "Exif": {
-                    piexif.ExifIFD.DateTimeOriginal: date_time.encode("ascii"),
-                    piexif.ExifIFD.DateTimeDigitized: date_time.encode("ascii"),
+                    piexif.ExifIFD.DateTimeOriginal: date_time_bytes,
+                    piexif.ExifIFD.DateTimeDigitized: date_time_bytes,
                     piexif.ExifIFD.SubSecTime: b"00",
                     piexif.ExifIFD.SubSecTimeOriginal: b"00",
                     piexif.ExifIFD.SubSecTimeDigitized: b"00",
@@ -1139,12 +1188,13 @@ class MediaProcessor:
 
             exif_bytes = piexif.dump(exif_dict)
 
-            # More efficient image processing with proper cleanup
+            # OPTIMIZATION: More efficient image processing with minimal I/O
             try:
                 img = Image.open(image_path)
-                img.save(image_path, exif=exif_bytes, optimize=True)
+                # OPTIMIZATION: Use quality=95 instead of optimize=True for faster processing
+                img.save(image_path, exif=exif_bytes, quality=95)
             except Exception as img_error:
-                # Fallback without optimization if there's an issue
+                # Fallback without quality optimization if there's an issue
                 if img:
                     img.close()
                     del img
@@ -1203,11 +1253,12 @@ class MediaProcessor:
         json_data = None
 
         if not json_path:
-            logging.warning(f"JSON file not found for {media_path}")
+            logging.info(f"No JSON metadata found for: {media_path.name}")
             with self._stats_lock:
                 self.stats["json_not_found"] += 1
             with self._files_lock:
                 self.files_without_json.append(str(media_path))
+            # File was processed (even though no JSON was found)
             return
 
         try:
@@ -1241,10 +1292,10 @@ class MediaProcessor:
             newdate = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
             with self._stats_lock:
                 self.stats["success"] += 1
-            logging.debug(f"Successfully processed {media_path} - new date: {newdate}")
+            logging.info(f"✓ Successfully updated: {media_path.name} → {newdate}")
 
         except Exception as e:
-            logging.error(f"An error occurred when processing {media_path}: {str(e)}")
+            logging.error(f"✗ Error processing {media_path.name}: {str(e)}")
             with self._stats_lock:
                 self.stats["warnings"] += 1
             with self._files_lock:
@@ -1256,16 +1307,38 @@ class MediaProcessor:
 
     def process_directory(self):
         """Processes all media files stored in directory"""
-        # Pre-collect all media files for better progress tracking
+        # Pre-collect all media files for better progress tracking - OPTIMIZED
         media_files = []
         logging.info("Scanning for media files...")
 
-        for file_path in self.work_dir.rglob("*"):
-            if file_path.is_file() and file_path.suffix.lower() in ALL_FORMATS:
-                media_files.append(file_path)
+        # OPTIMIZATION: Use faster globbing with specific patterns instead of checking every file
+        start_scan = datetime.now()
 
+        # Create specific patterns for each format to avoid checking every file
+        for pattern in [
+            "*.jpg",
+            "*.jpeg",
+            "*.png",
+            "*.gif",
+            "*.bmp",
+            "*.tiff",
+            "*.heic",
+            "*.mp4",
+            "*.mov",
+            "*.avi",
+            "*.mkv",
+            "*.webm",
+            "*.m4v",
+        ]:
+            media_files.extend(self.work_dir.rglob(pattern))
+            # Also check uppercase versions
+            media_files.extend(self.work_dir.rglob(pattern.upper()))
+
+        scan_time = datetime.now() - start_scan
         total_files = len(media_files)
-        logging.info(f"Found {total_files} media files to process")
+        logging.info(
+            f"Found {total_files} media files to process in {scan_time.total_seconds():.1f}s"
+        )
 
         if total_files == 0:
             logging.info("No media files found to process")
@@ -1276,7 +1349,25 @@ class MediaProcessor:
         progress_lock = threading.Lock()
         start_time = datetime.now()
 
-        # Determine progress reporting interval
+        # Initialize progress bar
+        try:
+            # Try to create a progress bar with tqdm
+            progress_bar = tqdm(
+                total=total_files,
+                desc="Processing media files",
+                unit="files",
+                unit_scale=False,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                disable=self.no_progress,  # Disable if requested
+            )
+            use_progress_bar = True
+        except ImportError:
+            # Fallback to basic progress logging if tqdm is not available
+            logging.warning("tqdm not available, using basic progress logging")
+            progress_bar = None
+            use_progress_bar = False
+
+        # Determine progress reporting interval for logging
         if total_files <= 10:
             progress_interval = 1
         elif total_files <= 100:
@@ -1287,88 +1378,182 @@ class MediaProcessor:
             progress_interval = 100
 
         def process_file(file_path):
+            """Enhanced file processing with comprehensive error handling"""
             nonlocal processed_count
-            logging.debug(f"Processing file: {file_path}")
-            self.process_media_file(file_path)
+            try:
+                logging.debug(f"Processing file: {file_path}")
+                self.process_media_file(file_path)
 
-            # Increment processed files counter for memory management
-            self._processed_files_count += 1
-
-            # Update progress
-            with progress_lock:
-                processed_count += 1
-
-                # Periodic garbage collection to prevent memory buildup
-                if processed_count % self._gc_interval == 0:
-                    gc.collect()
-                    logging.debug(
-                        f"Garbage collection triggered at {processed_count} files"
+            except Exception as e:
+                # Comprehensive error handling to prevent thread termination
+                logging.error(f"Unexpected error processing file {file_path}: {str(e)}")
+                with self._stats_lock:
+                    self.stats["warnings"] += 1
+                with self._files_lock:
+                    self.files_with_warnings.append(
+                        (str(file_path), f"Thread error: {str(e)}")
                     )
 
-                # Show progress at regular intervals or for milestones
-                if (
-                    processed_count % progress_interval == 0
-                    or processed_count == total_files
-                    or processed_count in [1, 5, 10, 25, 50]
-                ):
+            finally:
+                # ALWAYS update progress counter, regardless of success/failure/no-JSON
+                # Increment processed files counter for memory management
+                self._processed_files_count += 1
 
-                    elapsed_time = datetime.now() - start_time
-                    elapsed_seconds = elapsed_time.total_seconds()
+                # Update progress
+                with progress_lock:
+                    processed_count += 1
 
-                    if processed_count > 0 and elapsed_seconds > 0:
-                        files_per_second = processed_count / elapsed_seconds
-                        remaining_files = total_files - processed_count
-                        eta_seconds = (
-                            remaining_files / files_per_second
-                            if files_per_second > 0
-                            else 0
-                        )
-                        eta_str = (
-                            f", ETA: {int(eta_seconds//60)}m {int(eta_seconds%60)}s"
-                            if eta_seconds > 0
-                            else ""
+                    # Update progress bar
+                    if use_progress_bar and progress_bar:
+                        progress_bar.update(1)
+                        # Update progress bar postfix with success rate every 100 files
+                        if processed_count % 100 == 0 or processed_count == total_files:
+                            success_rate = (
+                                (self.stats["success"] / processed_count * 100)
+                                if processed_count > 0
+                                else 0
+                            )
+                            json_found_rate = (
+                                (
+                                    (self.stats["success"] + self.stats["warnings"])
+                                    / processed_count
+                                    * 100
+                                )
+                                if processed_count > 0
+                                else 0
+                            )
+                            progress_bar.set_postfix(
+                                {
+                                    "Success": f"{success_rate:.1f}%",
+                                    "JSON_found": f"{json_found_rate:.1f}%",
+                                }
+                            )
+
+                    # Periodic garbage collection to prevent memory buildup
+                    if processed_count % self._gc_interval == 0:
+                        gc.collect()
+                        logging.debug(
+                            f"Garbage collection triggered at {processed_count} files"
                         )
 
-                        logging.info(
-                            f"Progress: {processed_count}/{total_files} files processed "
-                            f"({processed_count/total_files*100:.1f}%) "
-                            f"- {files_per_second:.1f} files/sec{eta_str}"
-                        )
-                    else:
-                        eta_str = ""
-                        logging.info(
-                            f"Progress: {processed_count}/{total_files} files processed "
-                            f"({processed_count/total_files*100:.1f}%)"
-                        )
+                    # Show progress at regular intervals or for milestones (fallback logging)
+                    if not use_progress_bar or (
+                        processed_count % progress_interval == 0
+                        or processed_count == total_files
+                        or processed_count in [1, 5, 10, 25, 50]
+                    ):
+                        elapsed_time = datetime.now() - start_time
+                        elapsed_seconds = elapsed_time.total_seconds()
 
-        # Use ThreadPoolExecutor with conservative thread count for memory efficiency
+                        if processed_count > 0 and elapsed_seconds > 0:
+                            files_per_second = processed_count / elapsed_seconds
+                            remaining_files = total_files - processed_count
+                            eta_seconds = (
+                                remaining_files / files_per_second
+                                if files_per_second > 0
+                                else 0
+                            )
+                            eta_str = (
+                                f", ETA: {int(eta_seconds//60)}m {int(eta_seconds%60)}s"
+                                if eta_seconds > 0
+                                else ""
+                            )
+
+                            # Enhanced progress logging to show JSON match status
+                            success_rate = (
+                                (self.stats["success"] / processed_count * 100)
+                                if processed_count > 0
+                                else 0
+                            )
+                            json_found_rate = (
+                                (
+                                    (self.stats["success"] + self.stats["warnings"])
+                                    / processed_count
+                                    * 100
+                                )
+                                if processed_count > 0
+                                else 0
+                            )
+
+                            # Only log if not using progress bar or at milestones
+                            if not use_progress_bar:
+                                logging.info(
+                                    f"Progress: {processed_count}/{total_files} files processed "
+                                    f"({processed_count/total_files*100:.1f}%) "
+                                    f"- {files_per_second:.1f} files/sec{eta_str} "
+                                    f"- Success: {success_rate:.1f}% - JSON found: {json_found_rate:.1f}%"
+                                )
+                            else:
+                                # Even with progress bar, show milestone details in log
+                                if (
+                                    processed_count in [100, 500, 1000]
+                                    or processed_count % 1000 == 0
+                                ):
+                                    logging.info(
+                                        f"Milestone: {processed_count}/{total_files} files processed "
+                                        f"- Success: {success_rate:.1f}% - JSON found: {json_found_rate:.1f}%"
+                                    )
+                        else:
+                            eta_str = ""
+                            if not use_progress_bar:
+                                logging.info(
+                                    f"Progress: {processed_count}/{total_files} files processed "
+                                    f"({processed_count/total_files*100:.1f}%)"
+                                )
+
+        # Use ThreadPoolExecutor with OPTIMIZED thread count for better performance
         cpu_count = os.cpu_count() or 1
 
-        # Reduce thread count to prevent excessive memory usage
+        # OPTIMIZATION: More aggressive threading for I/O bound operations
         if cpu_count <= 4:
-            max_workers = min(4, cpu_count)
+            max_workers = min(8, cpu_count * 2)  # 2x for I/O bound
         elif cpu_count <= 8:
-            max_workers = min(8, cpu_count)
+            max_workers = min(16, cpu_count * 2)  # 2x for I/O bound
         else:
-            max_workers = min(12, cpu_count)
-
-        # Conservative thread count for systems with limited resources
-        if cpu_count <= 4:
-            max_workers = 4  # Conservative for lower-end systems
-        else:
-            max_workers = min(max_workers, 8)  # Cap at 8 for higher-end systems
+            max_workers = min(24, cpu_count * 2)  # Cap at 24 for very high-end systems
 
         logging.info(
-            f"CPU cores detected: {cpu_count}, using {max_workers} threads for parallel processing (memory optimized)"
+            f"CPU cores detected: {cpu_count}, using {max_workers} threads for parallel processing (I/O optimized)"
         )
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            executor.map(process_file, media_files)
+        # Enhanced threading with submit/as_completed for better error handling
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks and track them
+                future_to_file = {
+                    executor.submit(process_file, file_path): file_path
+                    for file_path in media_files
+                }
+
+                # Process completed tasks as they finish
+                completed_tasks = 0
+                for future in as_completed(future_to_file):
+                    file_path = future_to_file[future]
+                    completed_tasks += 1
+
+                    try:
+                        # Get the result (this will raise any exception that occurred)
+                        future.result()
+                    except Exception as e:
+                        # Log any exceptions from individual tasks
+                        logging.error(f"Task failed for {file_path}: {str(e)}")
+                        # Continue processing other files
+
+                    # Log major progress milestones
+                    if completed_tasks % 1000 == 0 or completed_tasks == total_files:
+                        logging.info(f"Completed {completed_tasks}/{total_files} tasks")
+
+        except Exception as e:
+            logging.error(f"ThreadPoolExecutor error: {str(e)}")
+        finally:
+            # Close progress bar
+            if use_progress_bar and progress_bar:
+                progress_bar.close()
 
         # Final cleanup
         gc.collect()
 
-        # Final progress report
+        # Final progress report with comprehensive statistics
         total_time = datetime.now() - start_time
         total_seconds = total_time.total_seconds()
         avg_files_per_second = total_files / total_seconds if total_seconds > 0 else 0
@@ -1379,6 +1564,56 @@ class MediaProcessor:
         logging.info(
             f"Average processing speed: {avg_files_per_second:.1f} files/second"
         )
+
+        # Enhanced completion summary
+        logging.info(f"Processing Summary:")
+        logging.info(f"  - Total media files found: {total_files}")
+        logging.info(f"  - Files successfully processed: {self.stats['success']}")
+        logging.info(f"  - Files with JSON not found: {self.stats['json_not_found']}")
+        logging.info(f"  - Files with warnings/errors: {self.stats['warnings']}")
+        logging.info(
+            f"  - JSON files found in other locations: {self.stats['json_found_in_other_dir']}"
+        )
+
+        # Calculate success rate
+        if total_files > 0:
+            success_rate = (self.stats["success"] / total_files) * 100
+            json_found_rate = (
+                (self.stats["success"] + self.stats["warnings"]) / total_files
+            ) * 100
+            no_json_rate = (self.stats["json_not_found"] / total_files) * 100
+
+            logging.info(
+                f"  - Success rate: {success_rate:.1f}% ({self.stats['success']}/{total_files})"
+            )
+            logging.info(
+                f"  - JSON found rate: {json_found_rate:.1f}% ({self.stats['success'] + self.stats['warnings']}/{total_files})"
+            )
+            logging.info(
+                f"  - No JSON found: {no_json_rate:.1f}% ({self.stats['json_not_found']}/{total_files})"
+            )
+
+            if success_rate < 50:
+                logging.warning(
+                    "Low success rate detected - this may indicate JSON file matching issues"
+                )
+                logging.warning(
+                    "Check that JSON files are in the same directory structure as media files"
+                )
+                logging.warning(
+                    "Consider running with debug mode for more detailed matching information"
+                )
+
+            if no_json_rate > 80:
+                logging.warning(
+                    f"Very high percentage ({no_json_rate:.1f}%) of files have no JSON matches"
+                )
+                logging.warning(
+                    "This suggests the JSON files may be in a different directory structure"
+                )
+                logging.warning(
+                    "or the file naming conventions don't match the expected patterns"
+                )
 
     def print_stats(self):
         """Shows processing statistics"""
@@ -1419,10 +1654,14 @@ class MediaProcessor:
             for file in self.files_without_json:
                 missing_json_summary.append(f"Missing JSON for: {file}")
 
-            # Print to console
-            print("\nJSON files not found:")
-            for file in self.files_without_json:
+            # Print to console (show first 10 examples)
+            print(f"\nJSON files not found ({len(self.files_without_json)} total):")
+            for i, file in enumerate(self.files_without_json[:10]):
                 print(f"- {file}")
+
+            if len(self.files_without_json) > 10:
+                print(f"... and {len(self.files_without_json) - 10} more files")
+                print(f"Check the log files for complete list")
 
             # Log to error file
             for line in missing_json_summary:
@@ -1430,6 +1669,28 @@ class MediaProcessor:
 
             # Write summary files
             self._write_summary_files()
+
+            # Additional diagnostic information
+            if len(self.files_without_json) > 0:
+                logging.info(f"Sample of files without JSON matches (first 5):")
+                for i, file_path in enumerate(self.files_without_json[:5]):
+                    logging.info(f"  {i+1}. {file_path}")
+                    # Try to provide some insight into why JSON wasn't found
+                    file_path_obj = Path(file_path)
+                    parent_dir = file_path_obj.parent
+                    json_files_in_dir = list(parent_dir.glob("*.json"))
+                    logging.info(f"     Directory: {parent_dir}")
+                    logging.info(
+                        f"     JSON files in same directory: {len(json_files_in_dir)}"
+                    )
+                    if json_files_in_dir:
+                        logging.info(
+                            f"     Example JSON files: {[f.name for f in json_files_in_dir[:3]]}"
+                        )
+                    else:
+                        logging.info(f"     No JSON files found in same directory")
+        else:
+            print("\nAll media files had matching JSON files!")
 
             # In rare cases, if JSON can't be found and error processing occurs, it's possible to manually set date and time for media by referring to the file name or album name in which it's located.
             response = input(
@@ -1663,11 +1924,16 @@ def main():
         action="store_true",
         help="Use conservative matching (higher thresholds, skip risky matches)",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bar display",
+    )
 
     args = parser.parse_args()
 
     processor = MediaProcessor(
-        args.work_dir, args.debug, args.dry_run, args.conservative
+        args.work_dir, args.debug, args.dry_run, args.conservative, args.no_progress
     )
     processor.process_directory()
     processor.print_stats()
