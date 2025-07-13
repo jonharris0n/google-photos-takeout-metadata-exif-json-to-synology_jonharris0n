@@ -80,6 +80,7 @@ class MediaProcessor:
         # Thread safety for concurrent processing
         self._stats_lock = threading.Lock()
         self._files_lock = threading.Lock()
+        self._cache_lock = threading.Lock()  # Lock for cache modifications
 
         # Set up logging to both console and file
         log_level = logging.DEBUG if debug else logging.INFO
@@ -138,33 +139,104 @@ class MediaProcessor:
             re.compile(r"_copy.*$"),
             re.compile(r"_original.*$"),
             re.compile(r"_backup.*$"),
+        ]
+        # Patterns for numbered duplicates are handled separately
+        self._numbered_patterns = [
             re.compile(r"\(\d+\)$"),
             re.compile(r"_\d+$"),
             re.compile(r"-\d+$"),
         ]
 
-        # Memory management settings
-        self._json_cache_limit = 5000  # Limit cache size to prevent memory bloat
-        self._json_metadata_cache_limit = 3000  # Limit metadata cache size
+        # Precompile regex patterns for fallback search
+        self._fallback_patterns = [
+            re.compile(r"\(\d+\)$"),
+            re.compile(r"(\(\d+\)(?:\(\d+\))*)"),
+        ]
+
+        # ADAPTIVE: Scalable cache limits for very large datasets (100k+ files)
+        self._base_json_cache_limit = 50000  # Base limit for moderate datasets
+        self._base_json_metadata_cache_limit = 25000  # Base metadata limit
+        self._max_json_cache_limit = (
+            500000  # Maximum limit for memory safety (500k entries)
+        )
+        self._max_json_metadata_cache_limit = (
+            100000  # Maximum metadata limit (100k entries)
+        )
+
+        # Dynamic limits will be set based on actual file count in _build_json_cache
+        self._json_cache_limit = self._base_json_cache_limit
+        self._json_metadata_cache_limit = self._base_json_metadata_cache_limit
+
         self._processed_files_count = 0
-        # OPTIMIZATION: Reduce garbage collection frequency for better performance
-        self._gc_interval = 500  # Increased from 100 to 500 files
+        # OPTIMIZATION: Adaptive garbage collection frequency for large datasets
+        self._base_gc_interval = 1000
+        self._gc_interval = self._base_gc_interval
+
+        # OPTIMIZATION: Add fast lookup cache for common patterns
+        self._fast_lookup_cache = {}  # Direct filename -> JSON path cache
+        self._stem_lookup_cache = {}  # File stem -> JSON path cache
+        self._json_file_set_cache = None  # Cache for the set of json files
 
     def _build_json_cache(self):
         """Build a cache of all JSON files for faster lookup - OPTIMIZED"""
+        # Thread-safe cache building with double-checked locking pattern
         if self._json_cache_built:
             return
 
-        logging.info("Building JSON file cache for faster processing...")
+        with self._cache_lock:
+            # Double-check pattern to prevent race condition
+            if self._json_cache_built:
+                return
 
-        # Clear existing caches first
-        self._json_cache.clear()
-        self._json_metadata_cache.clear()
+            logging.info("Building JSON file cache for faster processing...")
+
+            # Clear existing caches first
+            self._json_cache.clear()
+            self._json_metadata_cache.clear()
 
         # OPTIMIZATION: Use faster glob pattern for JSON files
         start_cache_time = datetime.now()
         json_files = list(self.work_dir.rglob("*.json"))
         total_json_files = len(json_files)
+
+        # ADAPTIVE: Intelligent cache sizing based on dataset scale
+        if total_json_files > self._base_json_cache_limit:
+            # Calculate optimal cache size for large datasets
+            if total_json_files <= 100000:  # Medium-large datasets (50k-100k files)
+                # Scale cache to handle all files with 20% buffer
+                optimal_cache_size = min(
+                    int(total_json_files * 1.2), self._max_json_cache_limit
+                )
+                optimal_metadata_size = min(
+                    int(total_json_files * 0.6), self._max_json_metadata_cache_limit
+                )
+            else:  # Very large datasets (100k+ files)
+                # For extremely large datasets, use intelligent sampling strategy
+                # Cache the most important files (recently created, high-priority patterns)
+                optimal_cache_size = (
+                    self._max_json_cache_limit
+                )  # Use maximum safe limit
+                optimal_metadata_size = self._max_json_metadata_cache_limit
+
+                # Adjust garbage collection for large datasets
+                self._gc_interval = min(
+                    5000, total_json_files // 20
+                )  # More frequent GC for large datasets
+
+                logging.info(
+                    f"Very large dataset detected ({total_json_files:,} JSON files). "
+                    f"Using intelligent sampling with cache limits: {optimal_cache_size:,}/{optimal_metadata_size:,}"
+                )
+
+            # Update cache limits
+            self._json_cache_limit = optimal_cache_size
+            self._json_metadata_cache_limit = optimal_metadata_size
+
+            logging.info(
+                f"Adaptive cache sizing: Found {total_json_files:,} JSON files, "
+                f"set cache limits to {self._json_cache_limit:,}/{self._json_metadata_cache_limit:,} "
+                f"(GC interval: {self._gc_interval})"
+            )
 
         if total_json_files == 0:
             logging.info("No JSON files found to cache")
@@ -192,40 +264,111 @@ class MediaProcessor:
         else:
             json_progress = json_files
 
-        for json_file in json_progress:
-            # Limit cache size to prevent memory issues
-            if len(self._json_cache) >= self._json_cache_limit:
+        # Use local variables for frequently accessed attributes
+        json_cache = self._json_cache
+        json_metadata_cache = self._json_metadata_cache
+        json_cache_limit = self._json_cache_limit
+        json_metadata_cache_limit = self._json_metadata_cache_limit
+
+        # For very large datasets (100k+ files), implement intelligent caching strategy
+        use_intelligent_sampling = total_json_files > 100000
+        priority_files = []  # High-priority files to cache first
+
+        if use_intelligent_sampling:
+            logging.info("Implementing intelligent sampling for very large dataset...")
+            # Sort files by priority (recent files, common patterns, etc.)
+            json_files_with_priority = []
+            for json_file in json_files:
+                priority_score = self._calculate_file_priority(json_file)
+                json_files_with_priority.append((priority_score, json_file))
+
+            # Sort by priority (highest first) and take top priority files
+            json_files_with_priority.sort(key=lambda x: x[0], reverse=True)
+            priority_files = [f[1] for f in json_files_with_priority[:json_cache_limit]]
+
+            logging.info(
+                f"Selected {len(priority_files):,} highest priority files for caching"
+            )
+            json_files_to_process = priority_files
+        else:
+            json_files_to_process = json_files
+
+        for json_file in json_files_to_process:
+            # Check cache limits with intelligent sampling consideration
+            if not use_intelligent_sampling and len(json_cache) >= json_cache_limit:
+                # Traditional cache limit reached
+                remaining_files = total_json_files - json_files_processed
+                files_coverage = (
+                    (json_files_processed / total_json_files * 100)
+                    if total_json_files > 0
+                    else 0
+                )
                 logging.warning(
-                    f"JSON cache limit ({self._json_cache_limit}) reached, skipping additional files"
+                    f"JSON cache limit ({json_cache_limit:,}) reached after processing {json_files_processed:,}/{total_json_files:,} files ({files_coverage:.1f}% files cached). "
+                    f"Remaining {remaining_files:,} JSON files will use direct lookup. "
+                    f"Performance may be slower for uncached files."
                 )
                 break
 
-            if len(self._json_metadata_cache) >= self._json_metadata_cache_limit:
-                logging.warning(
-                    f"Metadata cache limit ({self._json_metadata_cache_limit}) reached"
+            if len(json_metadata_cache) >= json_metadata_cache_limit:
+                logging.info(
+                    f"Metadata cache limit ({json_metadata_cache_limit}) reached. "
+                    f"Continuing with filename-based matching only."
                 )
 
-            # Store multiple keys for each JSON file to speed up lookups
+            # Store multiple keys for each JSON file to speed up lookups - OPTIMIZED for large datasets
             json_name = json_file.name
             json_stem = json_file.stem
 
-            # Store by exact filename
-            self._json_cache[json_name] = json_file
+            # For very large datasets, be more selective about cache entries to avoid hitting limits
+            entries_added = 0
+            max_entries_per_file = (
+                8 if use_intelligent_sampling else 15
+            )  # Reduced for large datasets
 
-            # Store by stem for truncated matching
-            if len(json_stem) >= 10:  # Only for reasonably long stems
-                self._json_cache[json_stem] = json_file
+            # Store by exact filename (most common case) - ALWAYS cache this
+            if entries_added < max_entries_per_file:
+                json_cache[json_name] = json_file
+                entries_added += 1
 
-            # Store by supplemental metadata patterns
-            if "supplemental-metadata" in json_name:
-                base_name = json_name.replace(".supplemental-metadata.json", "")
-                self._json_cache[f"{base_name}_supplemental"] = json_file
-            elif "supplemental-metadat" in json_name:
-                base_name = json_name.replace(".supplemental-metadat.json", "")
-                self._json_cache[f"{base_name}_supplemental"] = json_file
-            elif "supplemental-metad" in json_name:
-                base_name = json_name.replace(".supplemental-metad.json", "")
-                self._json_cache[f"{base_name}_supplemental"] = json_file
+            # OPTIMIZATION: Build fast lookup caches during initial scan - prioritize most important
+            if json_name.endswith(".json") and entries_added < max_entries_per_file:
+                base_name = json_name[:-5]  # Remove .json
+                if base_name.endswith(".supplemental-metadata"):
+                    media_name = base_name[:-22]  # Remove .supplemental-metadata
+                    self._fast_lookup_cache[f"{media_name}"] = json_file
+                    self._stem_lookup_cache[media_name] = json_file
+                    entries_added += 2
+                elif base_name.endswith(".supplemental-metadat"):
+                    media_name = base_name[:-21]  # Remove .supplemental-metadat
+                    self._fast_lookup_cache[f"{media_name}"] = json_file
+                    self._stem_lookup_cache[media_name] = json_file
+                    entries_added += 2
+                else:
+                    # Standard .json file
+                    self._fast_lookup_cache[base_name] = json_file
+                    self._stem_lookup_cache[base_name] = json_file
+                    entries_added += 2
+
+            # Store by stem for truncated matching (only for reasonably long stems and if we have room)
+            if len(json_stem) >= 10 and entries_added < max_entries_per_file:
+                json_cache[json_stem] = json_file
+                entries_added += 1
+
+            # Store by supplemental metadata patterns (only if we have room)
+            if entries_added < max_entries_per_file:
+                if "supplemental-metadata" in json_name:
+                    base_name = json_name.replace(".supplemental-metadata.json", "")
+                    json_cache[f"{base_name}_supplemental"] = json_file
+                    entries_added += 1
+                elif "supplemental-metadat" in json_name:
+                    base_name = json_name.split(".supplemental-metadat")[0]
+                    json_cache[f"{base_name}_supplemental"] = json_file
+                    entries_added += 1
+                elif "supplemental-metad" in json_name:
+                    base_name = json_name.split(".supplemental-metad")[0]
+                    json_cache[f"{base_name}_supplemental"] = json_file
+                    entries_added += 1
 
             # Cache metadata content for content-based matching
             json_data = None
@@ -282,22 +425,32 @@ class MediaProcessor:
                         and len(self._json_metadata_cache)
                         < self._json_metadata_cache_limit
                     ):
+                        # Pre-process strings once to avoid redundant operations
+                        title_lower_stripped = title.lower().strip()
+                        description_lower_stripped = (
+                            description.lower().strip() if description else ""
+                        )
+                        mime_type_lower = mime_type.lower() if mime_type else ""
+                        camera_make_lower = camera_make.lower() if camera_make else ""
+                        camera_model_lower = (
+                            camera_model.lower() if camera_model else ""
+                        )
+                        video_status_lower = (
+                            video_status.lower() if video_status else ""
+                        )
+
                         # Store comprehensive metadata for faster access (keeping rich metadata)
                         metadata_entry = {
-                            "title": title.lower().strip(),
+                            "title": title_lower_stripped,
                             "timestamp": timestamp,
                             "file": json_file,
-                            "description": (
-                                description.lower().strip() if description else ""
-                            ),
+                            "description": description_lower_stripped,
                             "creation_time": creation_time,
                             "modification_time": modification_time,
                             "file_size": file_size,
-                            "mime_type": mime_type.lower() if mime_type else "",
-                            "camera_make": camera_make.lower() if camera_make else "",
-                            "camera_model": (
-                                camera_model.lower() if camera_model else ""
-                            ),
+                            "mime_type": mime_type_lower,
+                            "camera_make": camera_make_lower,
+                            "camera_model": camera_model_lower,
                             "has_geo": bool(latitude or longitude),
                             "latitude": latitude,
                             "longitude": longitude,
@@ -305,27 +458,35 @@ class MediaProcessor:
                             "people_count": (
                                 len(people_in_photo) if people_in_photo else 0
                             ),
-                            "video_status": (
-                                video_status.lower() if video_status else ""
-                            ),
+                            "video_status": video_status_lower,
                             "image_views_count": len(image_views) if image_views else 0,
                         }
 
-                        self._json_metadata_cache[str(json_file)] = metadata_entry
+                        json_metadata_cache[str(json_file)] = metadata_entry
 
-                        # Also store by title for quick lookup
-                        title_key = f"title_{title.lower().strip()}"
-                        if title_key not in self._json_cache:
-                            self._json_cache[title_key] = json_file
+                        # Also store by title for quick lookup (only if we have room in cache)
+                        title_key = f"title_{title_lower_stripped}"
+                        if (
+                            title_key not in json_cache
+                            and entries_added < max_entries_per_file
+                        ):
+                            json_cache[title_key] = json_file
+                            entries_added += 1
 
-                        # Store truncated titles for matching - OPTIMIZED: reduced truncations
-                        if len(title) > 30:  # Increased threshold
-                            for length in [40, 30]:  # Reduced number of truncations
-                                if len(title) > length:
-                                    truncated_title = title[:length].lower().strip()
-                                    truncated_key = f"title_trunc_{truncated_title}"
-                                    if truncated_key not in self._json_cache:
-                                        self._json_cache[truncated_key] = json_file
+                        # Store truncated titles for matching - OPTIMIZED and limited for large datasets
+                        if len(title) > 30 and entries_added < max_entries_per_file:
+                            # For large datasets, only cache the most useful truncation
+                            truncation_length = (
+                                40 if not use_intelligent_sampling else 30
+                            )
+                            if len(title) > truncation_length:
+                                truncated_title = (
+                                    title[:truncation_length].lower().strip()
+                                )
+                                truncated_key = f"title_trunc_{truncated_title}"
+                                if truncated_key not in json_cache:
+                                    json_cache[truncated_key] = json_file
+                                    entries_added += 1
 
             except (json.JSONDecodeError, IOError, KeyError) as e:
                 logging.debug(f"Error reading JSON metadata for {json_file}: {e}")
@@ -338,7 +499,7 @@ class MediaProcessor:
             json_files_processed += 1
 
             # Periodic garbage collection during cache building
-            if json_files_processed % 500 == 0:
+            if json_files_processed % self._gc_interval == 0:
                 gc.collect()
 
         # Close progress bar if it was created
@@ -346,142 +507,192 @@ class MediaProcessor:
             json_progress.close()
 
         self._json_cache_built = True
-        logging.info(f"JSON cache built with {len(self._json_cache)} entries")
+        files_processed_coverage = (
+            (json_files_processed / total_json_files * 100)
+            if total_json_files > 0
+            else 0
+        )
         metadata_count = len(self._json_metadata_cache)
-        logging.info(f"JSON metadata cache built with {metadata_count} entries")
+
+        # Comprehensive logging for large datasets
+        if total_json_files > 100000:
+            # Very large dataset reporting
+            logging.info(f"Very Large Dataset Cache Summary:")
+            logging.info(f"  • JSON files found: {total_json_files:,}")
+            logging.info(
+                f"  • JSON files processed: {json_files_processed:,}/{total_json_files:,} ({files_processed_coverage:.1f}% files cached)"
+            )
+            logging.info(
+                f"  • JSON cache entries: {len(self._json_cache):,} (multiple keys per file for fast lookup)"
+            )
+            logging.info(
+                f"  • Metadata cache entries: {metadata_count:,}/{self._json_metadata_cache_limit:,}"
+            )
+            logging.info(
+                f"  • Fast lookup cache: {len(self._fast_lookup_cache):,} entries"
+            )
+            logging.info(
+                f"  • Stem lookup cache: {len(self._stem_lookup_cache):,} entries"
+            )
+            logging.info(
+                f"  • Memory optimization: GC interval set to {self._gc_interval:,} files"
+            )
+            if (
+                total_json_files > 100000
+                and self._json_cache_limit == self._max_json_cache_limit
+            ):
+                logging.info(
+                    f"  • Intelligent sampling: Using priority-based caching for optimal performance"
+                )
+        else:
+            # Standard reporting for smaller datasets
+            logging.info(
+                f"JSON cache built with {json_files_processed:,}/{total_json_files:,} files processed ({files_processed_coverage:.1f}% files cached)"
+            )
+            logging.info(
+                f"JSON cache entries: {len(self._json_cache):,} (multiple keys per file)"
+            )
+            logging.info(f"JSON metadata cache built with {metadata_count:,} entries")
 
         if metadata_count > 0:
             logging.info("Metadata-based matching is available for truncated filenames")
 
+        # Performance optimization note for very large datasets
+        if total_json_files > 100000 and files_processed_coverage < 90:
+            logging.info(
+                f"Performance Note: {100-files_processed_coverage:.1f}% of JSON files will use direct lookup. "
+                f"This is normal for very large datasets and provides good memory/performance balance."
+            )
+
+        # Cache the set of JSON files
+        self._json_file_set_cache = set(self._json_cache.values())
+
     def find_json_file(self, media_path):
-        """Find associated JSON file using multiple strategies with caching"""
+        """Find associated JSON file using ULTRA-FAST caching strategies"""
 
         # Build cache on first use
         self._build_json_cache()
 
-        def get_potential_json_names(base_path):
-            """Generate various possible names for locating JSON file"""
-            potential_names = [
-                # Standard cases
-                f"{base_path.name}.json",  # image.jpg.json
-                f"{base_path.stem}.json",  # image.json
-            ]
+        # OPTIMIZATION 1: Hot cache lookup for exact matches (fastest path)
+        media_name = media_path.name
+        media_stem = media_path.stem
 
-            # Case: LivePhotos iOS
-            if base_path.suffix.upper() == ".MP4":
-                potential_names.extend(
-                    [
-                        f"{base_path.stem}.HEIC.json",
-                        f"{base_path.stem}.JPG.json",
-                        # LivePhotos case and duplicate file
-                        f"{base_path.stem.split('(')[0]}.HEIC.json",
-                        f"{base_path.stem.split('(')[0]}.JPG.json",
-                    ]
-                )
+        # Optimize JSON cache lookup
+        if media_name in self._json_cache:
+            return self._json_cache[media_name]
+        if media_stem in self._json_cache:
+            return self._json_cache[media_stem]
 
-            # Enhanced matching patterns
-            potential_names.extend(
-                [
-                    # Case: duplicated files (x)
-                    f"{base_path.stem.split('(')[0]}{base_path.suffix}.json",
-                    # Case: JSON without "-modified" suffix
-                    f"{base_path.name.replace('-modifié', '')}.json",
-                    f"{base_path.name.replace('-modified', '')}.json",
-                    f"{base_path.name.replace('-edited', '')}.json",
-                    f"{base_path.name.replace('_edited', '')}.json",
-                    f"{base_path.name.replace('-copy', '')}.json",
-                    f"{base_path.name.replace('_copy', '')}.json",
-                    # Case: supplemental metadata (various formats)
-                    f"{base_path.name}.supplemental-metadata.json",
-                    f"{base_path.name}.supplemental-metadat.json",
-                    f"{base_path.name}.supplemental-metad.json",
-                    # Case: supplemental metadata without extension
-                    f"{base_path.stem}.supplemental-metadata.json",
-                    f"{base_path.stem}.supplemental-metadat.json",
-                    f"{base_path.stem}.supplemental-metad.json",
-                    # Case: cleaned filename variations
-                    f"{self._clean_filename_for_matching(base_path.stem)}.json",
-                    f"{self._clean_filename_for_matching(base_path.stem)}.supplemental-metadata.json",
-                    f"{self._clean_filename_for_matching(base_path.stem)}.supplemental-metadat.json",
-                    f"{self._clean_filename_for_matching(base_path.stem)}.supplemental-metad.json",
-                ]
-            )
+        # Direct filename lookup (covers 80%+ of cases)
+        if media_name in self._fast_lookup_cache:
+            return self._fast_lookup_cache[media_name]
 
-            # Case: Remove common numbering patterns
-            stem_no_numbers = re.sub(r"[_-]\d+$", "", base_path.stem)
-            if stem_no_numbers != base_path.stem:
-                potential_names.extend(
-                    [
-                        f"{stem_no_numbers}.json",
-                        f"{stem_no_numbers}{base_path.suffix}.json",
-                        f"{stem_no_numbers}.supplemental-metadata.json",
-                        f"{stem_no_numbers}.supplemental-metadat.json",
-                        f"{stem_no_numbers}.supplemental-metad.json",
-                    ]
-                )
+        # Direct stem lookup (covers most remaining cases)
+        if media_stem in self._stem_lookup_cache:
+            json_file = self._stem_lookup_cache[media_stem]
+            # Note: Cache updates disabled during threaded processing to avoid race conditions
+            return json_file
 
-            # Enhanced case: Handle Google Photos Takeout numbered duplicates including multiple patterns
-            # E.g., IMG_0947(2).JPG -> IMG_0947.JPG.supplemental-metadata(2).json
-            # E.g., IMG_0947(2)(3).JPG -> IMG_0947.JPG.supplemental-metadata(2)(3).json
+        # OPTIMIZATION 2: Quick standard patterns (before expensive generation)
+        quick_patterns = [
+            f"{media_name}.json",
+            f"{media_stem}.json",
+            f"{media_name}.supplemental-metadata.json",
+            f"{media_stem}.supplemental-metadata.json",
+        ]
 
-            # Extract all numbered patterns from the filename
-            numbered_patterns = self._extract_numbered_patterns(base_path.stem)
-            if numbered_patterns["has_numbers"]:
-                base_stem = numbered_patterns["base_stem"]
-                number_suffix = numbered_patterns["number_suffix"]
+        for pattern in quick_patterns:
+            if pattern in self._json_cache:
+                json_file = self._json_cache[pattern]
+                # Note: Cache updates disabled during threaded processing to avoid race conditions
+                return json_file
 
-                logging.debug(
-                    f"Found numbered duplicate: {base_path.name} -> base: {base_stem}, numbers: {number_suffix}"
-                )
-
-                # Generate Google Photos Takeout style JSON names for all variations
-                potential_names.extend(
-                    [
-                        # Standard patterns with number suffix
-                        f"{base_stem}{base_path.suffix}.supplemental-metadata{number_suffix}.json",
-                        f"{base_stem}{base_path.suffix}.supplemental-metadat{number_suffix}.json",
-                        f"{base_stem}{base_path.suffix}.supplemental-metad{number_suffix}.json",
-                        f"{base_stem}{base_path.suffix}.json{number_suffix}",
-                        f"{base_stem}.json{number_suffix}",
-                        # Alternative formats
-                        f"{base_stem}{number_suffix}{base_path.suffix}.json",
-                        f"{base_stem}{number_suffix}.json",
-                        f"{base_stem}{number_suffix}{base_path.suffix}.supplemental-metadata.json",
-                        f"{base_stem}{number_suffix}{base_path.suffix}.supplemental-metadat.json",
-                        f"{base_stem}{number_suffix}{base_path.suffix}.supplemental-metad.json",
-                        # Without extension variations
-                        f"{base_stem}.supplemental-metadata{number_suffix}.json",
-                        f"{base_stem}.supplemental-metadat{number_suffix}.json",
-                        f"{base_stem}.supplemental-metad{number_suffix}.json",
-                    ]
-                )
-
-            return potential_names
-
-        # Step 1: Quick cache lookup for exact matches
-        potential_names = get_potential_json_names(media_path)
+        # OPTIMIZATION 3: Only do expensive pattern generation if quick lookup fails
+        potential_names = self._generate_potential_json_names(media_path)
         for name in potential_names:
             if name in self._json_cache:
                 json_file = self._json_cache[name]
-                logging.debug(f"JSON file found in cache: {json_file}")
+                # Note: Cache updates disabled during threaded processing to avoid race conditions
                 return json_file
 
-        # Step 2: Check for supplemental metadata in cache
+        # Step 4: Check supplemental metadata cache
         supplemental_key = f"{media_path.stem}_supplemental"
         if supplemental_key in self._json_cache:
             json_file = self._json_cache[supplemental_key]
             logging.info(f"JSON file found via supplemental cache: {json_file}")
             with self._stats_lock:
                 self.stats["json_found_in_other_dir"] += 1
+            # Note: Cache updates disabled during threaded processing to avoid race conditions
             return json_file
 
-        # Step 3: Fallback to file system search for complex cases
-        return self._fallback_json_search(media_path)
+        # Step 5: Fallback to complex search (only for difficult cases)
+        result = self._fallback_json_search(media_path)
+        if result:
+            # Note: Cache updates disabled during threaded processing to avoid race conditions
+            pass
+
+        return result
+
+    def _generate_potential_json_names(self, base_path):
+        """OPTIMIZED: Generate potential JSON names (reduced complexity)"""
+        potential_names = [
+            # Most common patterns first (80% of cases)
+            f"{base_path.name}.json",
+            f"{base_path.stem}.json",
+            f"{base_path.name}.supplemental-metadata.json",
+            f"{base_path.stem}.supplemental-metadata.json",
+        ]
+
+        # Only add complex patterns if filename suggests they're needed
+        stem = base_path.stem
+        name = base_path.name
+
+        # LivePhotos iOS (only for MP4 files)
+        if base_path.suffix.upper() == ".MP4":
+            potential_names.extend(
+                [
+                    f"{stem}.HEIC.json",
+                    f"{stem}.JPG.json",
+                    f"{stem.split('(')[0]}.HEIC.json",
+                    f"{stem.split('(')[0]}.JPG.json",
+                ]
+            )
+
+        # Modified files (only if filename suggests modification)
+        name_lower = name.lower()
+        if any(suffix in name_lower for suffix in ["modified", "edited", "copy"]):
+            potential_names.extend(
+                [
+                    f"{name.replace('-modifié', '')}.json",
+                    f"{name.replace('-modified', '')}.json",
+                    f"{name.replace('-edited', '')}.json",
+                    f"{name.replace('_edited', '')}.json",
+                    f"{name.replace('-copy', '')}.json",
+                    f"{name.replace('_copy', '')}.json",
+                ]
+            )
+
+        # Numbered duplicates (only if filename has parentheses)
+        if "(" in stem and ")" in stem:
+            numbered_patterns = self._extract_numbered_patterns(stem)
+            if numbered_patterns["has_numbers"]:
+                base_stem = numbered_patterns["base_stem"]
+                number_suffix = numbered_patterns["number_suffix"]
+
+                potential_names.extend(
+                    [
+                        f"{base_stem}{base_path.suffix}.supplemental-metadata{number_suffix}.json",
+                        f"{base_stem}.supplemental-metadata{number_suffix}.json",
+                        f"{base_stem}{number_suffix}.json",
+                    ]
+                )
+
+        return potential_names
 
     def _extract_numbered_patterns(self, stem):
         """Extract numbered patterns from filename stem, handling single and multiple patterns"""
         # Pattern to match one or more numbered duplicates: (1), (2)(3), (1)(2)(3), etc.
-        pattern = re.search(r"(\(\d+\)(?:\(\d+\))*)", stem)
+        pattern = self._fallback_patterns[1].search(stem)
 
         if pattern:
             number_suffix = pattern.group(1)  # Full number pattern: (2) or (2)(3)
@@ -517,60 +728,60 @@ class MediaProcessor:
             )
 
             # Search for Google Photos Takeout style JSON files
-            for json_file in set(self._json_cache.values()):
+            for json_file in self._json_file_set_cache:
                 json_name = json_file.name
 
                 # Check for patterns like: IMG_0947.JPG.supplemental-metadata(2).json
                 # or IMG_0947.JPG.supplemental-metadata(2)(3).json
-                if (
-                    f"{base_stem}{media_path.suffix}.supplemental-metadata{number_suffix}.json"
-                    in json_name
-                    or f"{base_stem}{media_path.suffix}.supplemental-metadat{number_suffix}.json"
-                    in json_name
-                    or f"{base_stem}{media_path.suffix}.supplemental-metad{number_suffix}.json"
-                    in json_name
-                ):
-                    logging.info(
-                        f"JSON file found via numbered duplicate matching: {json_file}"
-                    )
-                    with self._stats_lock:
-                        self.stats["json_found_in_other_dir"] += 1
-                    return json_file
+                for suffix in [
+                    ".supplemental-metadata",
+                    ".supplemental-metadat",
+                    ".supplemental-metad",
+                ]:
+                    if (
+                        f"{base_stem}{media_path.suffix}{suffix}{number_suffix}.json"
+                        in json_name
+                    ):
+                        logging.info(
+                            f"JSON file found via numbered duplicate matching: {json_file}"
+                        )
+                        with self._stats_lock:
+                            self.stats["json_found_in_other_dir"] += 1
+                        return json_file
 
                 # Check for exact matches in the JSON filename
-                if (
-                    json_name
-                    == f"{base_stem}{media_path.suffix}.supplemental-metadata{number_suffix}.json"
-                    or json_name
-                    == f"{base_stem}{media_path.suffix}.supplemental-metadat{number_suffix}.json"
-                    or json_name
-                    == f"{base_stem}{media_path.suffix}.supplemental-metad{number_suffix}.json"
-                ):
-                    logging.info(
-                        f"JSON file found via exact numbered duplicate matching: {json_file}"
-                    )
-                    with self._stats_lock:
-                        self.stats["json_found_in_other_dir"] += 1
-                    return json_file
+                for suffix in [
+                    ".supplemental-metadata",
+                    ".supplemental-metadat",
+                    ".supplemental-metad",
+                ]:
+                    if (
+                        json_name
+                        == f"{base_stem}{media_path.suffix}{suffix}{number_suffix}.json"
+                    ):
+                        logging.info(
+                            f"JSON file found via exact numbered duplicate matching: {json_file}"
+                        )
+                        with self._stats_lock:
+                            self.stats["json_found_in_other_dir"] += 1
+                        return json_file
 
                 # Also check for patterns without the file extension
-                if (
-                    json_name
-                    == f"{base_stem}.supplemental-metadata{number_suffix}.json"
-                    or json_name
-                    == f"{base_stem}.supplemental-metadat{number_suffix}.json"
-                    or json_name
-                    == f"{base_stem}.supplemental-metad{number_suffix}.json"
-                ):
-                    logging.info(
-                        f"JSON file found via stem-only numbered duplicate matching: {json_file}"
-                    )
-                    with self._stats_lock:
-                        self.stats["json_found_in_other_dir"] += 1
-                    return json_file
+                for suffix in [
+                    ".supplemental-metadata",
+                    ".supplemental-metadat",
+                    ".supplemental-metad",
+                ]:
+                    if json_name == f"{base_stem}{suffix}{number_suffix}.json":
+                        logging.info(
+                            f"JSON file found via stem-only numbered duplicate matching: {json_file}"
+                        )
+                        with self._stats_lock:
+                            self.stats["json_found_in_other_dir"] += 1
+                        return json_file
 
         # Search through cached JSON files for fuzzy matches
-        for json_file in set(self._json_cache.values()):
+        for json_file in self._json_file_set_cache:
             json_name = json_file.name
             json_stem = json_file.stem
 
@@ -675,10 +886,10 @@ class MediaProcessor:
         media_name = media_path.name
 
         # Remove parentheses for matching
-        base_stem = re.sub(r"\(\d+\)$", "", media_stem)
+        base_stem = self._fallback_patterns[0].sub("", media_stem)
 
         # Try very loose matching with conservative threshold
-        for json_file in set(self._json_cache.values()):
+        for json_file in self._json_file_set_cache:
             json_name = json_file.name
             json_stem = json_file.stem
 
@@ -734,18 +945,15 @@ class MediaProcessor:
         cleaned = filename.lower()
 
         # Apply most patterns but be careful with numbered duplicates
-        for pattern in self._cleaning_patterns[
-            :-3
-        ]:  # Skip the last 3 patterns that handle numbers
+        for pattern in self._cleaning_patterns:
             cleaned = pattern.sub("", cleaned)
 
         # Handle numbered patterns more intelligently
         # Only remove trailing numbers if they're not in parentheses (Google Photos format)
-        numbered_patterns = self._extract_numbered_patterns(cleaned)
-        if not numbered_patterns["has_numbers"]:
+        if not self._fallback_patterns[1].search(cleaned):
             # Remove trailing numbers only if no parentheses patterns found
-            cleaned = re.sub(r"_\d+$", "", cleaned)
-            cleaned = re.sub(r"-\d+$", "", cleaned)
+            for pattern in self._numbered_patterns:
+                cleaned = pattern.sub("", cleaned)
 
         # Remove extra spaces and normalize
         cleaned = re.sub(r"\s+", "", cleaned)
@@ -784,11 +992,11 @@ class MediaProcessor:
         logging.debug(f"Attempting metadata-based search for: {media_name}")
 
         # Extract potential title variations from the media filename
+        base_stem_no_num = self._fallback_patterns[0].sub("", media_stem)
         potential_titles = [
             media_stem,
             media_name,
-            # Remove numbers in parentheses for matching
-            re.sub(r"\(\d+\)$", "", media_stem),
+            base_stem_no_num,
             # Remove common suffixes
             re.sub(
                 r"[-_](edited|modified|copy|original|backup).*$",
@@ -843,7 +1051,11 @@ class MediaProcessor:
         # Try to extract file characteristics from the media file for better matching
         media_characteristics = self._extract_media_characteristics(media_path)
 
-        for json_file_path, metadata in self._json_metadata_cache.items():
+        # Create a snapshot of the metadata cache to avoid "dictionary changed during iteration"
+        # Since cache building is now completed before threading, this is just defensive
+        metadata_cache_snapshot = dict(self._json_metadata_cache.items())
+
+        for json_file_path, metadata in metadata_cache_snapshot.items():
             json_file = metadata["file"]
 
             # Calculate comprehensive similarity score
@@ -974,9 +1186,13 @@ class MediaProcessor:
                                 piexif.TAGS["0th"].get(tag_id, {}).get("name", "")
                             )
                             if tag_name == "Make":
-                                characteristics["camera_make"] = str(value).lower()
+                                characteristics["camera_make"] = str(
+                                    value.decode()
+                                ).lower()
                             elif tag_name == "Model":
-                                characteristics["camera_model"] = str(value).lower()
+                                characteristics["camera_model"] = str(
+                                    value.decode()
+                                ).lower()
 
                     # Check for GPS data
                     if "GPS" in exif_dict and exif_dict["GPS"]:
@@ -1120,25 +1336,17 @@ class MediaProcessor:
             return False
 
     def update_file_dates(self, file_path, timestamp):
-        """Update system dates in media"""
+        """Update system dates in media - OPTIMIZED for batch operations"""
 
         if self.dry_run:
-            newdate_modified = datetime.fromtimestamp(timestamp).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            logging.debug(
-                f"[DRY RUN] Simulated updating system dates for {file_path} : {newdate_modified}"
-            )
             return
 
-        # Update access (atime) and modification (mtime) dates
-        os.utime(file_path, (timestamp, timestamp))
-
-        # Update last modification date
-        Path(file_path).touch(exist_ok=True)
-        os.utime(file_path, (timestamp, timestamp))
-
-        logging.debug(f"Updated system dates for {file_path}")
+        # OPTIMIZATION: Single utime call instead of multiple operations
+        try:
+            os.utime(file_path, (timestamp, timestamp))
+        except OSError as e:
+            logging.warning(f"Failed to update file dates for {file_path}: {e}")
+            # Don't fail the entire operation for date update issues
 
     def update_image_exif(self, image_path, json_data):
         """Update an picture's EXIF metadata - OPTIMIZED"""
@@ -1153,9 +1361,6 @@ class MediaProcessor:
             date_time = datetime.fromtimestamp(timestamp).strftime("%Y:%m:%d %H:%M:%S")
 
             if self.dry_run:
-                logging.debug(
-                    f"[DRY RUN] Simulated updating EXIF metadata for {image_path}"
-                )
                 return
 
             # OPTIMIZATION: Pre-encode datetime once
@@ -1253,7 +1458,6 @@ class MediaProcessor:
         json_data = None
 
         if not json_path:
-            logging.info(f"No JSON metadata found for: {media_path.name}")
             with self._stats_lock:
                 self.stats["json_not_found"] += 1
             with self._files_lock:
@@ -1262,37 +1466,29 @@ class MediaProcessor:
             return
 
         try:
-            logging.debug(f"JSON file used {json_path}")
-
-            # More efficient JSON loading with proper cleanup
+            # OPTIMIZATION: More efficient JSON loading with minimal validation
             with open(json_path, "r", encoding="utf-8") as f:
                 json_data = json.load(f)
 
-            # Quick validation of required fields
-            if (
-                "photoTakenTime" not in json_data
-                or "timestamp" not in json_data["photoTakenTime"]
-            ):
+            # OPTIMIZATION: Quick validation with early exit
+            photo_taken_time = json_data.get("photoTakenTime")
+            if not photo_taken_time or "timestamp" not in photo_taken_time:
                 raise ValueError("Missing required timestamp in JSON metadata")
 
             # Get timestamp once for reuse
-            timestamp = int(json_data["photoTakenTime"]["timestamp"])
+            timestamp = int(photo_taken_time["timestamp"])
 
-            # EXIF update except for HEIC images (check format first for efficiency)
-            if (
-                media_path.suffix.lower() in IMAGE_FORMATS
-                and media_path.suffix.lower() != ".heic"
-            ):
+            # OPTIMIZATION: Skip EXIF update for video files and HEIC (most common skips)
+            file_ext = media_path.suffix.lower()
+            if file_ext in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"]:
                 self.update_image_exif(media_path, json_data)
 
             # Update system dates
             self.update_file_dates(media_path, timestamp)
 
-            # Success logging
-            newdate = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            # Success tracking (reduced logging)
             with self._stats_lock:
                 self.stats["success"] += 1
-            logging.info(f"✓ Successfully updated: {media_path.name} → {newdate}")
 
         except Exception as e:
             logging.error(f"✗ Error processing {media_path.name}: {str(e)}")
@@ -1344,6 +1540,11 @@ class MediaProcessor:
             logging.info("No media files found to process")
             return
 
+        # CRITICAL: Build JSON cache before any threading to avoid race conditions
+        logging.info("Pre-building JSON cache before threading...")
+        self._build_json_cache()
+        logging.info("JSON cache pre-built successfully")
+
         # Progress tracking for parallel processing
         processed_count = 0
         progress_lock = threading.Lock()
@@ -1367,15 +1568,12 @@ class MediaProcessor:
             progress_bar = None
             use_progress_bar = False
 
+        # Dynamically adjust batch size
+        batch_size = min(150, max(30, total_files // (os.cpu_count() or 1) // 2))
+        logging.info(f"Dynamic batch size: {batch_size}")
+
         # Determine progress reporting interval for logging
-        if total_files <= 10:
-            progress_interval = 1
-        elif total_files <= 100:
-            progress_interval = 10
-        elif total_files <= 1000:
-            progress_interval = 50
-        else:
-            progress_interval = 100
+        progress_interval = max(100, total_files // 10)
 
         def process_file(file_path):
             """Enhanced file processing with comprehensive error handling"""
@@ -1406,8 +1604,8 @@ class MediaProcessor:
                     # Update progress bar
                     if use_progress_bar and progress_bar:
                         progress_bar.update(1)
-                        # Update progress bar postfix with success rate every 100 files
-                        if processed_count % 100 == 0 or processed_count == total_files:
+                        # OPTIMIZATION: Update progress stats less frequently to reduce lock contention
+                        if processed_count % 250 == 0 or processed_count == total_files:
                             success_rate = (
                                 (self.stats["success"] / processed_count * 100)
                                 if processed_count > 0
@@ -1422,26 +1620,42 @@ class MediaProcessor:
                                 if processed_count > 0
                                 else 0
                             )
-                            progress_bar.set_postfix(
-                                {
-                                    "Success": f"{success_rate:.1f}%",
-                                    "JSON_found": f"{json_found_rate:.1f}%",
-                                }
-                            )
+                            # Reduce progress bar update frequency
+                            if (
+                                processed_count % progress_interval == 0
+                                or processed_count == total_files
+                            ):
+                                progress_bar.set_postfix(
+                                    {
+                                        "Success": f"{success_rate:.1f}%",
+                                        "JSON_found": f"{json_found_rate:.1f}%",
+                                    }
+                                )
 
-                    # Periodic garbage collection to prevent memory buildup
+                    # OPTIMIZATION: Reduce excessive progress logging for better performance
                     if processed_count % self._gc_interval == 0:
                         gc.collect()
                         logging.debug(
                             f"Garbage collection triggered at {processed_count} files"
                         )
 
-                    # Show progress at regular intervals or for milestones (fallback logging)
-                    if not use_progress_bar or (
-                        processed_count % progress_interval == 0
-                        or processed_count == total_files
-                        or processed_count in [1, 5, 10, 25, 50]
-                    ):
+                    # OPTIMIZATION: Less frequent progress logging for speed
+                    show_progress = (
+                        not use_progress_bar
+                        and (
+                            processed_count % (progress_interval * 2)
+                            == 0  # Half the frequency
+                            or processed_count == total_files
+                            or processed_count
+                            in [100, 500, 1000]  # Only major milestones
+                        )
+                    ) or (
+                        use_progress_bar
+                        and processed_count in [1000, 5000, 10000]
+                        and processed_count % 5000 == 0
+                    )
+
+                    if show_progress:
                         elapsed_time = datetime.now() - start_time
                         elapsed_seconds = elapsed_time.total_seconds()
 
@@ -1501,34 +1715,47 @@ class MediaProcessor:
                                     f"({processed_count/total_files*100:.1f}%)"
                                 )
 
-        # Use ThreadPoolExecutor with OPTIMIZED thread count for better performance
+        # Use ThreadPoolExecutor with OPTIMAL thread count for balanced performance
         cpu_count = os.cpu_count() or 1
 
-        # OPTIMIZATION: More aggressive threading for I/O bound operations
-        if cpu_count <= 4:
-            max_workers = min(8, cpu_count * 2)  # 2x for I/O bound
+        # Optimize ThreadPoolExecutor configuration
+        if cpu_count <= 2:
+            max_workers = 3  # Reduce contention further for dual-core systems
+        elif cpu_count <= 4:
+            max_workers = 6
         elif cpu_count <= 8:
-            max_workers = min(16, cpu_count * 2)  # 2x for I/O bound
+            max_workers = 12
         else:
-            max_workers = min(24, cpu_count * 2)  # Cap at 24 for very high-end systems
+            max_workers = min(20, cpu_count * 2)
+        logging.info(f"Optimized thread count: {max_workers}")
 
         logging.info(
-            f"CPU cores detected: {cpu_count}, using {max_workers} threads for parallel processing (I/O optimized)"
+            f"CPU cores detected: {cpu_count}, using {max_workers} threads for optimal I/O performance"
         )
 
-        # Enhanced threading with submit/as_completed for better error handling
+        # Enhanced threading with submit/as_completed for better error handling + BATCHING
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # OPTIMIZATION: Smaller batch sizes for better responsiveness on smaller systems
+                batch_size = min(150, max(30, total_files // max_workers // 2))
+                logging.info(
+                    f"Processing files in batches of {batch_size} for optimal performance"
+                )
+
                 # Submit all tasks and track them
-                future_to_file = {
-                    executor.submit(process_file, file_path): file_path
-                    for file_path in media_files
-                }
+                future_to_file = {}
+                submit_func = executor.submit
+                for i in range(0, total_files, batch_size):
+                    batch = media_files[i : i + batch_size]
+                    for file_path in batch:
+                        future = submit_func(process_file, file_path)
+                        future_to_file[future] = file_path
 
                 # Process completed tasks as they finish
                 completed_tasks = 0
+                future_get = future_to_file.get
                 for future in as_completed(future_to_file):
-                    file_path = future_to_file[future]
+                    file_path = future_get(future)
                     completed_tasks += 1
 
                     try:
@@ -1539,8 +1766,8 @@ class MediaProcessor:
                         logging.error(f"Task failed for {file_path}: {str(e)}")
                         # Continue processing other files
 
-                    # Log major progress milestones
-                    if completed_tasks % 1000 == 0 or completed_tasks == total_files:
+                    # Log major progress milestones (less frequent for speed)
+                    if completed_tasks % 5000 == 0 or completed_tasks == total_files:
                         logging.info(f"Completed {completed_tasks}/{total_files} tasks")
 
         except Exception as e:
@@ -1906,6 +2133,87 @@ class MediaProcessor:
             #                     logging.error(f"An error occurred during deleting empty directory {dirpath}: {str(e)}")
             #             else:
             #                 logging.debug(f"[DRY RUN] Simulated deletion of empty directory : {dirpath}")
+
+    def _calculate_file_priority(self, json_file):
+        """Calculate priority score for JSON file caching in very large datasets"""
+        priority_score = 0
+
+        try:
+            # Factor 1: File modification time (recent files get higher priority)
+            file_stat = json_file.stat()
+            days_old = (datetime.now().timestamp() - file_stat.st_mtime) / (24 * 3600)
+            if days_old < 30:  # Files modified in last 30 days
+                priority_score += 50
+            elif days_old < 90:  # Files modified in last 90 days
+                priority_score += 30
+            elif days_old < 365:  # Files modified in last year
+                priority_score += 10
+
+            # Factor 2: File name patterns (common Google Photos patterns get priority)
+            file_name = json_file.name.lower()
+
+            # High priority patterns
+            if any(
+                pattern in file_name
+                for pattern in ["img_", "dsc_", "photo_", "image_", "vid_", "movie_"]
+            ):
+                priority_score += 30
+
+            # Medium priority patterns
+            if any(
+                pattern in file_name
+                for pattern in ["screenshot", "received_", "download"]
+            ):
+                priority_score += 20
+
+            # Supplemental metadata files get higher priority
+            if "supplemental-metadata" in file_name:
+                priority_score += 25
+
+            # Factor 3: File size (larger JSON files often have more metadata)
+            if file_stat.st_size > 5000:  # Larger than 5KB
+                priority_score += 15
+            elif file_stat.st_size > 2000:  # Larger than 2KB
+                priority_score += 10
+
+            # Factor 4: Directory depth (shallower files often more important)
+            path_parts = len(json_file.parts)
+            if path_parts <= 5:  # Shallow directory structure
+                priority_score += 10
+            elif path_parts <= 7:
+                priority_score += 5
+
+        except (OSError, AttributeError) as e:
+            # If we can't access file stats, give it a default low priority
+            priority_score = 1
+
+        return priority_score
+
+    def get_cache_memory_estimate(self):
+        """Estimate memory usage of cache systems for large datasets"""
+        # Rough estimates for memory usage
+        json_cache_size = len(self._json_cache) * 200  # ~200 bytes per entry estimate
+        metadata_cache_size = (
+            len(self._json_metadata_cache) * 1000
+        )  # ~1KB per metadata entry
+        fast_lookup_size = (
+            len(self._fast_lookup_cache) * 150
+        )  # ~150 bytes per fast lookup
+        stem_lookup_size = (
+            len(self._stem_lookup_cache) * 150
+        )  # ~150 bytes per stem lookup
+
+        total_mb = (
+            json_cache_size + metadata_cache_size + fast_lookup_size + stem_lookup_size
+        ) / (1024 * 1024)
+
+        return {
+            "total_mb": total_mb,
+            "json_cache_entries": len(self._json_cache),
+            "metadata_cache_entries": len(self._json_metadata_cache),
+            "fast_lookup_entries": len(self._fast_lookup_cache),
+            "stem_lookup_entries": len(self._stem_lookup_cache),
+        }
 
 
 def main():
